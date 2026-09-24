@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>抖音 + 微信视频号 订单数据处理工具</title>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Microsoft YaHei", sans-serif;
+         max-width: 960px; margin: 24px auto; padding: 0 16px; color: #222; }
+  h1 { font-size: 22px; margin: 0 0 6px; }
+  .hint { color: #888; font-size: 13px; margin: 0 0 20px; }
+  .upload-box {
+    border: 2px dashed #4a90d9; border-radius: 10px;
+    padding: 32px 16px; text-align: center; background: #f8fbff;
+    transition: .2s; cursor: pointer; user-select: none;
+  }
+  .upload-box.dragover { background: #e6f0ff; border-color: #2c6cb0; }
+  .upload-box p { margin: 6px 0; color: #666; font-size: 14px; }
+  .upload-box .big { font-size: 16px; color: #357ab8; font-weight: 600; }
+  .btns { margin: 16px 0; display: flex; gap: 10px; flex-wrap: wrap; }
+  button {
+    padding: 10px 22px; background: #4a90d9; color: #fff; border: none;
+    border-radius: 6px; font-size: 14px; cursor: pointer;
+  }
+  button:disabled { background: #ccc; cursor: not-allowed; }
+  button:hover:not(:disabled) { background: #357ab8; }
+  button.secondary { background: #6c757d; }
+  button.secondary:hover:not(:disabled) { background: #565e64; }
+  #fileList { margin: 12px 0; padding: 0; list-style: none; }
+  #fileList li {
+    padding: 6px 12px; border: 1px solid #e0e0e0; border-radius: 6px;
+    margin-bottom: 6px; font-size: 13px; display: flex;
+    justify-content: space-between; align-items: center;
+  }
+  #fileList .tag { font-size: 12px; padding: 2px 8px; border-radius: 10px; color: #fff; }
+  .tag.dy { background: #e63946; }
+  .tag.wx { background: #28a745; }
+  .tag.other { background: #888; }
+  #log {
+    background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 8px;
+    font-family: Consolas, "Courier New", monospace; font-size: 13px;
+    white-space: pre-wrap; max-height: 520px; overflow: auto;
+    margin-top: 16px; line-height: 1.5;
+  }
+  #downloads { margin-top: 16px; display: flex; flex-direction: column; gap: 8px; }
+  #downloads .dl-item {
+    padding: 10px 16px; background: #f0f8ff; border: 1px solid #b6d8f5;
+    border-radius: 6px; display: flex; justify-content: space-between;
+    align-items: center; font-size: 14px;
+  }
+  #downloads .dl-item button { padding: 6px 16px; font-size: 13px; }
+  .ok { color: #28a745; font-weight: 600; }
+  .warn { color: #ffc107; }
+  .err { color: #ff6b6b; }
+</style>
+</head>
+<body>
+
+<h1>抖音 + 微信视频号 订单数据处理工具</h1>
+<p class="hint">
+  支持文件：<code>抖-*.csv</code>（UTF-8 / GBK）与 <code>视频号-*.xlsx</code>。
+  数据只在本地浏览器处理，不会上传服务器。
+</p>
+
+<div class="upload-box" id="dropZone">
+  <p class="big">点击选择文件，或将文件拖拽到此处</p>
+  <p>可一次选中多个文件（抖音 CSV + 微信 XLSX 混选）</p>
+  <input type="file" id="fileInput" multiple accept=".csv,.xlsx" style="display:none">
+</div>
+
+<ul id="fileList"></ul>
+
+<div class="btns">
+  <button id="processBtn" disabled>开始处理</button>
+  <button id="clearBtn" class="secondary">清空文件</button>
+  <button id="downloadLogBtn" class="secondary" disabled>下载日志 (.txt)</button>
+</div>
+
+<div id="log"></div>
+<div id="downloads"></div>
+
+<script>
+// =================== 配置区（与 Python 保持一致） ===================
+const OUTPUT_COLS = ["达人昵称", "商品数量", "平台", "年级", "商品", "uid", "订单号", "商家备注"];
+const SHEET_NAMES = ["白瑞芳", "建昆", "胡源", "李珍"];
+
+const PRODUCT_RULES_DY = [["源", "胡源"], ["白", "白瑞芳"], ["建昆", "建昆"], ["珍", "李珍"]];
+const PRODUCT_RULES_WX = [["白", "白瑞芳"], ["建昆", "建昆"], ["珍", "李珍"], ["源", "胡源"]];
+const GRADE_RULES = [
+  ["高一", "新高一"], ["高二", "新高二"], ["高三", "新高三"],
+  ["初一", "新初一"], ["初二", "新初二"], ["初三", "新初三"],
+];
+
+// =================== 工具函数 ===================
+function isBlank(v) {
+  if (v === null || v === undefined) return true;
+  const s = String(v).trim();
+  return s === "" || s.toLowerCase() === "nan";
+}
+
+function keywordMap(value, rules) {
+  if (isBlank(value)) return null;
+  const text = String(value);
+  for (const [kw, res] of rules) {
+    if (text.includes(kw)) return res;
+  }
+  return null;
+}
+
+// 尝试用 UTF-8 解码；失败或出现替换字符则退到 GBK
+function decodeBuffer(buf) {
+  const bytes = new Uint8Array(buf);
+  let start = 0;
+  if (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) {
+    start = 3; // 去 BOM
+  }
+  const slice = bytes.subarray(start);
+
+  // 先试严格 UTF-8
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(slice);
+  } catch (e) { /* 继续 */ }
+
+  // 退到 GBK（大多数现代浏览器支持）
+  try {
+    return new TextDecoder("gbk").decode(slice);
+  } catch (e) { /* 继续 */ }
+
+  // 兜底：宽松 UTF-8
+  return new TextDecoder("utf-8").decode(slice);
+}
+
+// 读取 CSV / XLSX -> 对象数组（所有值为字符串）
+async function readTable(file) {
+  const buf = await file.arrayBuffer();
+  let wb;
+  if (file.name.toLowerCase().endsWith(".csv")) {
+    const text = decodeBuffer(buf);
+    wb = XLSX.read(text, { type: "string", raw: false });
+  } else {
+    wb = XLSX.read(buf, { type: "array", raw: false });
+  }
+  const sheetName = wb.SheetNames[0];
+  const sheet = wb.Sheets[sheetName];
+  if (!sheet) throw new Error(`文件里没有工作表：${file.name}`);
+  const rows = XLSX.utils.sheet_to_json(sheet, { defval: "", raw: false });
+  return rows;
+}
+
+// =================== 单文件明细统计 ===================
+function fileStats(rows) {
+  const stats = {};
+  for (const n of SHEET_NAMES) stats[n] = 0;
+  let unmatched = 0;
+  for (const r of rows) {
+    if (r["商品"] === null) unmatched++;
+    else if (r["商品"] in stats) stats[r["商品"]]++;
+  }
+  return { stats, unmatched };
+}
+
+// =================== 处理：抖音 CSV ===================
+function processDouyin(rows) {
+  const rawCount = rows.length;
+  const filtered = rows.filter(r => {
+    const status   = String(r["订单状态"] ?? "").trim();
+    const afterSale = String(r["售后状态"] ?? "").trim();
+    const nick     = String(r["达人昵称"] ?? "").trim();
+    return status !== "已关闭" && afterSale === "-" && nick !== "";
+  });
+
+  const result = filtered.map(r => ({
+    "达人昵称": String(r["达人昵称"] ?? "").trim(),
+    "商品数量": 1,
+    "平台": "抖音",
+    "uid": String(r["达人ID"] ?? "").trim(),
+    "订单号": String(r["主订单编号"] ?? "").trim(),
+    "商家备注": String(r["商家备注"] ?? "").trim(),
+    "商品": keywordMap(r["选购商品"], PRODUCT_RULES_DY),
+    "年级": keywordMap(r["选购商品"], GRADE_RULES),
+  }));
+
+  return { rows: result, rawCount, filteredCount: filtered.length };
+}
+
+// =================== 处理：微信视频号 XLSX ===================
+function processWechat(rows) {
+  const rawCount = rows.length;
+  const filtered = rows.filter(r => {
+    const status = String(r["订单状态"] ?? "").trim();
+    const daihuoId = String(r["带货ID"] ?? "").trim();
+    return status !== "已取消" && !isBlank(daihuoId) && daihuoId !== "-";
+  });
+
+  const result = filtered.map(r => ({
+    // 源列 带货账号昵称 -> 输出列 达人昵称
+    "达人昵称": String(r["带货账号昵称"] ?? r["达人昵称"] ?? "").trim(),
+    "商品数量": 1,
+    "平台": "视频号",
+    "uid": String(r["带货ID"] ?? "").trim(),
+    "订单号": String(r["订单号"] ?? "").trim(),
+    "商家备注": String(r["商家备注"] ?? "").trim(),
+    "商品": keywordMap(r["商品名称"], PRODUCT_RULES_WX),
+    "年级": keywordMap(r["商品属性"], GRADE_RULES),
+  }));
+
+  return { rows: result, rawCount, filteredCount: filtered.length };
+}
+
+// =================== 输出：按达人拆分 ===================
+function buildSplitWorkbook(rows, includeUnmatched) {
+  const wb = XLSX.utils.book_new();
+  let any = false;
+
+  for (const name of SHEET_NAMES) {
+    const part = rows.filter(r => r["商品"] === name);
+    const aoa = [OUTPUT_COLS, ...part.map(r => OUTPUT_COLS.map(c => r[c]))];
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    XLSX.utils.book_append_sheet(wb, ws, name);
+    any = true;
+  }
+
+  const unmatched = rows.filter(r => r["商品"] === null);
+  if (includeUnmatched && unmatched.length > 0) {
+    const aoa = [OUTPUT_COLS, ...unmatched.map(r => OUTPUT_COLS.map(c => r[c]))];
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(aoa), "未匹配");
+  }
+
+  if (!any) {
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([OUTPUT_COLS]), "空白");
+  }
+  return wb;
+}
+
+function downloadWorkbook(wb, filename) {
+  const arr = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+  const blob = new Blob([arr], {
+    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+// =================== 日志 ===================
+let logBuffer = "";
+function log(msg = "") {
+  logBuffer += msg + "\n";
+  const el = document.getElementById("log");
+  el.textContent += msg + "\n";
+  el.scrollTop = el.scrollHeight;
+}
+function logClear() {
+  logBuffer = "";
+  document.getElementById("log").textContent = "";
+}
+
+// =================== 主流程 ===================
+async function runAll(dyFiles, wxFiles) {
+  logClear();
+  document.getElementById("downloads").innerHTML = "";
+
+  const startTime = new Date();
+  log(`运行时间：${formatTime(startTime)}`);
+  log(`已选文件：抖音 ${dyFiles.length} 个，微信 ${wxFiles.length} 个`);
+  log("=".repeat(64));
+
+  // ---------- 抖音 ----------
+  log(`\n【抖音 CSV】共发现 ${dyFiles.length} 个文件`);
+  let dyRows = [];
+  if (dyFiles.length > 0) {
+    for (const f of dyFiles) {
+      const rows = await readTable(f);
+      const { rows: processed, rawCount, filteredCount } = processDouyin(rows);
+      log(`    ▸ ${f.name}`);
+      log(`        原始 ${rawCount} 行 → 过滤后 ${filteredCount} 行`);
+      const { stats, unmatched } = fileStats(processed);
+      for (const n of SHEET_NAMES) log(`        ${pad(n, 4)}: ${stats[n]} 行`);
+      log(`        未匹配: ${unmatched} 行`);
+      const sum = SHEET_NAMES.reduce((a, n) => a + stats[n], 0) + unmatched;
+      if (sum !== filteredCount) log(`        [核对异常] ${sum} ≠ ${filteredCount}`);
+      dyRows = dyRows.concat(processed);
+    }
+
+    const { stats, unmatched } = fileStats(dyRows);
+    log(`  ── 抖音合计：${dyRows.length} 行`);
+    for (const n of SHEET_NAMES) log(`     ${pad(n, 4)}: ${stats[n]} 行`);
+    log(`     未匹配: ${unmatched} 行`);
+  } else {
+    log("  未发现『抖-*.csv』文件");
+  }
+
+  // ---------- 微信 ----------
+  log(`\n【微信视频号 XLSX】共发现 ${wxFiles.length} 个文件`);
+  let wxRows = [];
+  if (wxFiles.length > 0) {
+    for (const f of wxFiles) {
+      const rows = await readTable(f);
+      const { rows: processed, rawCount, filteredCount } = processWechat(rows);
+      log(`    ▸ ${f.name}`);
+      log(`        原始 ${rawCount} 行 → 过滤后 ${filteredCount} 行`);
+      const { stats, unmatched } = fileStats(processed);
+      for (const n of SHEET_NAMES) log(`        ${pad(n, 4)}: ${stats[n]} 行`);
+      log(`        未匹配: ${unmatched} 行`);
+      const sum = SHEET_NAMES.reduce((a, n) => a + stats[n], 0) + unmatched;
+      if (sum !== filteredCount) log(`        [核对异常] ${sum} ≠ ${filteredCount}`);
+      wxRows = wxRows.concat(processed);
+    }
+
+    const { stats, unmatched } = fileStats(wxRows);
+    log(`  ── 微信合计：${wxRows.length} 行`);
+    for (const n of SHEET_NAMES) log(`     ${pad(n, 4)}: ${stats[n]} 行`);
+    log(`     未匹配: ${unmatched} 行`);
+  } else {
+    log("  未发现『视频号-*.xlsx』文件");
+  }
+
+  // ---------- 合并 ----------
+  const both = dyRows.concat(wxRows);
+  const { stats: bstats } = fileStats(both);
+  log(`\n【合并输出】`);
+  log(`     总计: ${both.length} 行`);
+  for (const n of SHEET_NAMES) log(`     ${pad(n, 4)}: ${bstats[n]} 行`);
+
+  // ---------- 生成 3 个文件 ----------
+  log(`\n【生成文件】`);
+  const ts = formatStamp(startTime);
+
+  if (dyFiles.length > 0) {
+    const wb = buildSplitWorkbook(dyRows, true);
+    const name = `处理结果_抖音_${ts}.xlsx`;
+    downloadWorkbook(wb, name);
+    addDownloadItem(name, () => downloadWorkbook(wb, name));
+    log(`  ✔ ${name}`);
+  }
+  if (wxFiles.length > 0) {
+    const wb = buildSplitWorkbook(wxRows, true);
+    const name = `处理结果_微信_${ts}.xlsx`;
+    downloadWorkbook(wb, name);
+    addDownloadItem(name, () => downloadWorkbook(wb, name));
+    log(`  ✔ ${name}`);
+  }
+  {
+    const wb = buildSplitWorkbook(both, false);
+    const name = `处理结果_合并_${ts}.xlsx`;
+    downloadWorkbook(wb, name);
+    addDownloadItem(name, () => downloadWorkbook(wb, name));
+    log(`  ✔ ${name}`);
+  }
+
+  log("\n全部完成 ✅");
+  document.getElementById("downloadLogBtn").disabled = false;
+}
+
+// 小工具
+function pad(s, n) {
+  s = String(s);
+  while (s.length < n) s += " ";
+  return s;
+}
+function formatTime(d) {
+  const p = x => String(x).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ` +
+         `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+function formatStamp(d) {
+  const p = x => String(x).padStart(2, "0");
+  return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}_` +
+         `${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+function addDownloadItem(filename, onclick) {
+  const wrap = document.getElementById("downloads");
+  const div = document.createElement("div");
+  div.className = "dl-item";
+  const span = document.createElement("span");
+  span.textContent = "📄 " + filename;
+  const btn = document.createElement("button");
+  btn.textContent = "重新下载";
+  btn.onclick = onclick;
+  div.appendChild(span);
+  div.appendChild(btn);
+  wrap.appendChild(div);
+}
+
+// =================== 文件选择 & 拖拽 ===================
+let allFiles = [];
+
+function refreshFileList() {
+  const ul = document.getElementById("fileList");
+  ul.innerHTML = "";
+  for (const f of allFiles) {
+    const li = document.createElement("li");
+    const nameSpan = document.createElement("span");
+    nameSpan.textContent = f.name;
+    const tag = document.createElement("span");
+    if (f.name.startsWith("抖-") && f.name.toLowerCase().endsWith(".csv")) {
+      tag.textContent = "抖音 CSV";
+      tag.className = "tag dy";
+    } else if (f.name.startsWith("视频号-") && f.name.toLowerCase().endsWith(".xlsx")) {
+      tag.textContent = "微信 XLSX";
+      tag.className = "tag wx";
+    } else {
+      tag.textContent = "不识别";
+      tag.className = "tag other";
+    }
+    li.appendChild(nameSpan);
+    li.appendChild(tag);
+    ul.appendChild(li);
+  }
+  document.getElementById("processBtn").disabled = allFiles.length === 0;
+}
+
+function addFiles(fileList) {
+  for (const f of fileList) {
+    if (!allFiles.some(x => x.name === f.name && x.size === f.size)) {
+      allFiles.push(f);
+    }
+  }
+  refreshFileList();
+}
+
+document.getElementById("dropZone").addEventListener("click", () => {
+  document.getElementById("fileInput").click();
+});
+document.getElementById("fileInput").addEventListener("change", e => {
+  addFiles(e.target.files);
+  e.target.value = ""; // 允许再次选同一个文件
+});
+
+["dragenter", "dragover"].forEach(evt => {
+  document.getElementById("dropZone").addEventListener(evt, e => {
+    e.preventDefault();
+    e.stopPropagation();
+    document.getElementById("dropZone").classList.add("dragover");
+  });
+});
+["dragleave", "drop"].forEach(evt => {
+  document.getElementById("dropZone").addEventListener(evt, e => {
+    e.preventDefault();
+    e.stopPropagation();
+    document.getElementById("dropZone").classList.remove("dragover");
+  });
+});
+document.getElementById("dropZone").addEventListener("drop", e => {
+  if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files);
+});
+
+document.getElementById("clearBtn").addEventListener("click", () => {
+  allFiles = [];
+  refreshFileList();
+  logClear();
+  document.getElementById("downloads").innerHTML = "";
+  document.getElementById("downloadLogBtn").disabled = true;
+});
+
+document.getElementById("downloadLogBtn").addEventListener("click", () => {
+  const blob = new Blob([logBuffer], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `处理日志_${formatStamp(new Date())}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+});
+
+document.getElementById("processBtn").addEventListener("click", async () => {
+  const btn = document.getElementById("processBtn");
+  btn.disabled = true;
+  btn.textContent = "处理中...";
+  try {
+    const dyFiles = allFiles.filter(f =>
+      f.name.startsWith("抖-") && f.name.toLowerCase().endsWith(".csv"));
+    const wxFiles = allFiles.filter(f =>
+      f.name.startsWith("视频号-") && f.name.toLowerCase().endsWith(".xlsx"));
+    await runAll(dyFiles, wxFiles);
+  } catch (e) {
+    log(`\n[错误] ${e && e.message ? e.message : e}`);
+    console.error(e);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "开始处理";
+  }
+});
+</script>
+
+</body>
+</html>
